@@ -13,7 +13,6 @@
 #include <fcntl.h>
 
 #include "memlib.h"
-#include "config.h"
 
 /* private variables */
 static unsigned char *heap;

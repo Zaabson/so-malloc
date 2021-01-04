@@ -6,6 +6,8 @@
  *
  * Copyright (c) 2004, R. Bryant and D. O'Hallaron, All rights reserved.
  * May not be used, modified, or copied without permission.
+ *
+ * WARNING! This file has been heavily modified compared to the original.
  */
 #include <assert.h>
 #include <errno.h>
@@ -18,9 +20,8 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/time.h>
 
-#include "config.h"
-#include "fsecs.h"
 #include "memlib.h"
 #include "mm.h"
 
@@ -30,9 +31,8 @@
 
 /* Misc */
 #define MAXLINE 1024 /* max string size */
-#define HDRLINES 4   /* number of header lines in a trace file */
 /* cnvt trace request nums to linenums (origin 1) */
-#define LINENUM(i) ((i) + 5)
+#define LINENUM(i) (i + 5)
 
 /* Returns true if p is ALIGNMENT-byte aligned */
 #define IS_ALIGNED(p) ((((unsigned long)(p)) % ALIGNMENT) == 0)
@@ -128,20 +128,7 @@ static randint_t random_data[RANDOM_DATA_LEN];
 
 static enum { DBG_NONE, DBG_CHEAP, DBG_EXPENSIVE } debug_mode = DBG_CHEAP;
 
-int verbose = 1;       /* global flag for verbose output */
-static int errors = 0; /* number of errs found when running student malloc */
-int onetime_flag = 0;
-
-/* by default, no timeouts */
-static int set_timeout = 0;
-
-/* Directory where default tracefiles are found */
-static char tracedir[MAXLINE] = TRACEDIR;
-
-/* The filenames of the default tracefiles */
-static char *default_tracefiles[] = {DEFAULT_TRACEFILES, NULL};
-
-char autoresult[MAXLINE]; /* autoresult string */
+static int verbose = 1; /* global flag for verbose output */
 
 /*********************
  * Function prototypes
@@ -159,8 +146,7 @@ static void check_index(const trace_t *trace, int opnum, int index);
 static void randomize_block(trace_t *trace, int index);
 
 /* These functions read, allocate, and free storage for traces */
-static trace_t *read_trace(stats_t *stats, const char *tracedir,
-                           const char *filename);
+static trace_t *read_trace(stats_t *stats, const char *filename);
 static void reinit_trace(trace_t *trace);
 static void free_trace(trace_t *trace);
 
@@ -171,11 +157,11 @@ static void eval_libc_speed(void *ptr);
 /* Routines for evaluating correctnes, space utilization, and speed
    of the student's malloc package in mm.c */
 static int eval_mm_valid(trace_t *trace, range_t **ranges);
-static double eval_mm_util(trace_t *trace, int tracenum);
+static double eval_mm_util(trace_t *trace);
 static void eval_mm_speed(void *ptr);
 
 /* Various helper routines */
-static void printresults(int n, stats_t *stats);
+static void printresults(stats_t *stats);
 static void usage(void);
 static void malloc_error(const trace_t *trace, int opnum, const char *fmt, ...)
   __attribute__((format(printf, 3, 4)));
@@ -184,92 +170,69 @@ static void unix_error(const char *fmt, ...)
 static void app_error(const char *fmt, ...)
   __attribute__((format(printf, 1, 2), noreturn));
 
-static sigjmp_buf timeout_jmpbuf;
+/****************************
+ * High-level timing wrappers
+ ****************************/
 
-/* Timeout signal handler */
-static void timeout_handler(int sig __attribute__((unused))) {
-  fprintf(stderr, "The driver timed out after %d secs\n", set_timeout);
-  errors = 1;
-  longjmp(timeout_jmpbuf, 1);
+typedef void (*fsecs_test_funct)(void *);
+
+/*
+ * fsecs - Return the running time of a function f (in seconds)
+ */
+static double fsecs(fsecs_test_funct f, void *argp) {
+  struct timeval stv, etv;
+  double diff;
+
+  gettimeofday(&stv, NULL);
+  f(argp);
+  gettimeofday(&etv, NULL);
+  diff = 1E3 * (etv.tv_sec - stv.tv_sec) + 1E-3 * (etv.tv_usec - stv.tv_usec);
+  return (1E-3 * diff);
 }
 
 /* Run the tests; return the number of tests run (may be less than
    num_tracefiles, if there's a timeout) */
-static int run_tests(int num_tracefiles, const char *tracedir,
-                     char **tracefiles, stats_t *mm_stats, range_t *ranges,
-                     speed_t *speed_params) {
-  volatile int i, errors = 0;
-  volatile int timed_out = 0;
+static void run_tests(char *tracefile, stats_t *mm_stats, range_t *ranges,
+                      speed_t *speed_params) {
+  /* initialize simulated memory system in memlib.c *
+   * start each trace with a clean system */
+  mem_init();
 
-  for (i = 0; i < num_tracefiles; i++) {
-    /* initialize simulated memory system in memlib.c *
-     * start each trace with a clean system */
-    mem_init();
+  trace_t *trace;
+  trace = read_trace(mm_stats, tracefile);
+  strcpy(mm_stats->filename, trace->filename);
+  mm_stats->ops = trace->num_ops;
+  if (verbose > 1)
+    printf("Checking mm_malloc for correctness, ");
+  mm_stats->valid = eval_mm_valid(trace, &ranges);
 
-    /* handle timeouts */
-    if (setjmp(timeout_jmpbuf) != 0) {
-      timed_out = 1;
-    }
-
-    trace_t *trace;
-    trace = read_trace(&mm_stats[i], tracedir, tracefiles[i]);
-    strcpy(mm_stats[i].filename, trace->filename);
-    mm_stats[i].ops = trace->num_ops;
-    if (timed_out) {
-      mm_stats[i].valid = 0;
-    } else {
-      if (verbose > 1)
-        printf("Checking mm_malloc for correctness, ");
-      mm_stats[i].valid = eval_mm_valid(trace, &ranges);
-      if (!mm_stats[i].valid)
-        errors++;
-
-      if (onetime_flag) {
-        free_trace(trace);
-        return errors;
-      }
-    }
-    if (mm_stats[i].valid) {
-      if (verbose > 1)
-        printf("efficiency, ");
-      mm_stats[i].util = eval_mm_util(trace, i);
-      speed_params->trace = trace;
-      speed_params->ranges = ranges;
-      if (verbose > 1)
-        printf("and performance.\n");
-      mm_stats[i].secs = fsecs(eval_mm_speed, speed_params);
-    }
-
-    free_trace(trace);
-
-    /* clean up memory system */
-    mem_deinit();
+  if (mm_stats->valid) {
+    if (verbose > 1)
+      printf("efficiency, ");
+    mm_stats->util = eval_mm_util(trace);
+    speed_params->trace = trace;
+    speed_params->ranges = ranges;
+    if (verbose > 1)
+      printf("and performance.\n");
+    mm_stats->secs = fsecs(eval_mm_speed, speed_params);
   }
 
-  return errors;
+  free_trace(trace);
+
+  /* clean up memory system */
+  mem_deinit();
 }
 
 /**************
  * Main routine
  **************/
 int main(int argc, char **argv) {
-  int i;
-  char c;
-  char **tracefiles = NULL; /* null-terminated array of trace file names */
-  int num_tracefiles = 0;   /* the number of traces in that array */
-
-  range_t *ranges = NULL;     /* keeps track of block extents for one trace */
-  stats_t *libc_stats = NULL; /* libc stats for each trace */
-  stats_t *mm_stats = NULL;   /* mm (i.e. student) stats for each trace */
-  speed_t speed_params;       /* input parameters to the xx_speed routines */
-
-  int run_libc = 0;   /* If set, run libc malloc (set by -l) */
-  int autograder = 0; /* if set then called by autograder (-A) */
-
-  /* temporaries used to compute the performance index */
-  double secs, ops, util, avg_mm_util, avg_mm_throughput = 0, p1, p2, perfindex;
-  double util_weight = 0, perf_weight = 0;
-  int numcorrect;
+  char *tracefile = NULL; /* trace file names */
+  range_t *ranges = NULL; /* keeps track of block extents for one trace */
+  stats_t libc_stats;     /* libc stats for trace */
+  stats_t mm_stats;       /* mm (i.e. student) stats for trace */
+  speed_t speed_params;   /* input parameters to the xx_speed routines */
+  int run_libc = 0;       /* If set, run libc malloc (set by -l) */
 
   setbuf(stdout, 0);
   setbuf(stderr, 0);
@@ -277,38 +240,11 @@ int main(int argc, char **argv) {
   /*
    * Read and interpret the command line arguments
    */
-  while ((c = getopt(argc, argv, "d:f:c:s:t:v:hVAlD")) != EOF) {
+  char c;
+  while ((c = getopt(argc, argv, "d:f:v:hVlD")) != EOF) {
     switch (c) {
-
-      case 'A': /* Hidden Autolab driver argument */
-        autograder = 1;
-        break;
-
       case 'f': /* Use one specific trace file only (relative to curr dir) */
-        num_tracefiles = 1;
-        if ((tracefiles = realloc(tracefiles, 2 * sizeof(char *))) == NULL)
-          unix_error("ERROR: realloc failed in main");
-        strcpy(tracedir, "./");
-        tracefiles[0] = strdup(optarg);
-        tracefiles[1] = NULL;
-        break;
-
-      case 'c': /* Use one specific trace file and run only once */
-        num_tracefiles = 1;
-        onetime_flag = 1;
-        if ((tracefiles = realloc(tracefiles, 2 * sizeof(char *))) == NULL)
-          unix_error("ERROR: realloc failed in main");
-        strcpy(tracedir, "./");
-        tracefiles[0] = strdup(optarg);
-        tracefiles[1] = NULL;
-        break;
-
-      case 't':                  /* Directory where the traces are located */
-        if (num_tracefiles == 1) /* ignore if -f already encountered */
-          break;
-        strcpy(tracedir, optarg);
-        if (tracedir[strlen(tracedir) - 1] != '/')
-          strcat(tracedir, "/"); /* path always ends with "/" */
+        tracefile = strdup(optarg);
         break;
 
       case 'l': /* Run libc malloc */
@@ -331,208 +267,66 @@ int main(int argc, char **argv) {
         debug_mode = DBG_EXPENSIVE;
         break;
 
-      case 's':
-        set_timeout = atoi(optarg);
-        break;
-
       case 'h': /* Print this message */
         usage();
-        exit(0);
+        exit(EXIT_SUCCESS);
 
       default:
         usage();
-        exit(1);
+        exit(EXIT_FAILURE);
     }
   }
 
-  if (tracefiles == NULL) {
-    tracefiles = default_tracefiles;
-    num_tracefiles = sizeof(default_tracefiles) / sizeof(char *) - 1;
-    printf("Using default tracefiles in %s\n", tracedir);
+  if (tracefile == NULL) {
+    usage();
+    exit(EXIT_FAILURE);
   }
 
-  if (debug_mode != DBG_NONE) {
+  if (debug_mode != DBG_NONE)
     init_random_data();
-  }
 
-  /* Initialize the timing package */
-  init_fsecs();
-
-  /* Initialize the timeout */
-  if (set_timeout > 0) {
-    signal(SIGALRM, timeout_handler);
-    alarm(set_timeout);
-  }
-
-  /*
-   * Optionally run and evaluate the libc malloc package
-   */
   if (run_libc) {
+    /*
+     * Run and evaluate the libc malloc package
+     */
     if (verbose > 1)
       printf("\nTesting libc malloc\n");
 
-    /* Allocate libc stats array, with one stats_t struct per tracefile */
-    libc_stats = (stats_t *)calloc(num_tracefiles, sizeof(stats_t));
-    if (libc_stats == NULL)
-      unix_error("libc_stats calloc in main failed");
-
     /* Evaluate the libc malloc package using the K-best scheme */
-    for (i = 0; i < num_tracefiles; i++) {
-      trace_t *trace = read_trace(&libc_stats[i], tracedir, tracefiles[i]);
+    trace_t *trace = read_trace(&libc_stats, tracefile);
 
-      if (verbose > 1)
-        printf("Checking libc malloc for correctness, ");
-      libc_stats[i].valid = eval_libc_valid(trace);
-      if (libc_stats[i].valid) {
-        speed_params.trace = trace;
-        if (verbose > 1)
-          printf("and performance.\n");
-        libc_stats[i].secs = fsecs(eval_libc_speed, &speed_params);
-      }
-      free_trace(trace);
+    libc_stats.valid = eval_libc_valid(trace);
+    if (libc_stats.valid) {
+      speed_params.trace = trace;
+      libc_stats.secs = fsecs(eval_libc_speed, &speed_params);
     }
+    free_trace(trace);
 
     /* Display the libc results in a compact table */
     if (verbose) {
       printf("\nResults for libc malloc:\n");
-      printresults(num_tracefiles, libc_stats);
+      printresults(&libc_stats);
     }
+
+    return libc_stats.valid ? EXIT_SUCCESS : EXIT_FAILURE;
   }
 
   /*
-   * Always run and evaluate the student's mm package
+   * Run and evaluate the student's mm package
    */
   if (verbose > 1)
     printf("\nTesting mm malloc\n");
 
   /* Allocate the mm stats array, with one stats_t struct per tracefile */
-  mm_stats = (stats_t *)calloc(num_tracefiles, sizeof(stats_t));
-  if (mm_stats == NULL)
-    unix_error("mm_stats calloc in main failed");
+  run_tests(tracefile, &mm_stats, ranges, &speed_params);
 
-  int errors = run_tests(num_tracefiles, tracedir, tracefiles, mm_stats, ranges,
-                         &speed_params);
-
-  /* Display the mm results in a compact table */
+  /* Display the mm results */
   if (verbose) {
-    if (onetime_flag) {
-      printf("\n\ncorrectness check finished, by running tracefile \"%s\".\n",
-             tracefiles[num_tracefiles - 1]);
-      if (mm_stats[num_tracefiles - 1].valid) {
-        printf(" => correct.\n\n");
-      } else {
-        printf(" => incorrect.\n\n");
-      }
-    } else {
-      printf("\nResults for mm malloc:\n");
-      printresults(num_tracefiles, mm_stats);
-      printf("\n");
-    }
+    printf("\nResults for mm malloc:\n");
+    printresults(&mm_stats);
   }
 
-  /*
-   * Accumulate the aggregate statistics for the student's mm package
-   */
-  secs = 0;
-  ops = 0;
-  util = 0;
-  numcorrect = 0;
-
-  /*
-   * trace weight:
-   * weight 1 => count both util and perf
-   *        2 => count only util
-   *        3 => count only perf
-   */
-  for (i = 0; i < num_tracefiles; i++) {
-    if (mm_stats[i].weight == WALL || mm_stats[i].weight == WPERF) {
-      secs += mm_stats[i].secs;
-      ops += mm_stats[i].ops;
-      perf_weight++;
-    }
-    if (mm_stats[i].weight == WALL || mm_stats[i].weight == WUTIL) {
-      util += mm_stats[i].util;
-      util_weight++;
-    }
-
-    if (mm_stats[i].valid)
-      numcorrect++;
-  }
-
-  if (util_weight == 0)
-    avg_mm_util = 0;
-  else
-    avg_mm_util = util / util_weight;
-
-  /*
-   * Compute and print the performance index
-   */
-  if (errors == 0) {
-    if (perf_weight == 0) {
-      avg_mm_throughput = 0;
-    } else {
-      avg_mm_throughput = (secs == 0) ? 0 : ops / secs;
-    }
-
-#ifdef ALT_GRADING
-    if (avg_mm_throughput < MIN_SPEED) {
-      p2 = 0.0;
-    } else if (avg_mm_throughput > MAX_SPEED) {
-      p2 = 1.0;
-    } else {
-      p2 = (avg_mm_throughput - MIN_SPEED) / (MAX_SPEED - MIN_SPEED);
-    }
-
-    if (avg_mm_util < MIN_SPACE) {
-      p1 = 0.0;
-    } else if (avg_mm_util > MAX_SPACE) {
-      p1 = 1.0;
-    } else {
-      p1 = (avg_mm_util - MIN_SPACE) / (MAX_SPACE - MIN_SPACE);
-    }
-
-    perfindex = p1 < p2 ? p1 * 100.0 : p2 * 100.0;
-    if (perfindex < 0.0)
-      perfindex = 0.0;
-    if (perfindex > 100.0)
-      perfindex = 100.0;
-#else
-    if (avg_mm_util < MIN_SPACE) {
-      p1 = 0.0;
-    } else if (avg_mm_util > MAX_SPACE) {
-      p1 = UTIL_WEIGHT;
-    } else {
-      p1 = (avg_mm_util - MIN_SPACE) / (MAX_SPACE - MIN_SPACE) * UTIL_WEIGHT;
-    }
-
-    if (avg_mm_throughput < MIN_SPEED) {
-      p2 = 0.0;
-    } else if (avg_mm_throughput > MAX_SPEED) {
-      p2 = 1.0 - UTIL_WEIGHT;
-    } else {
-      p2 = (avg_mm_throughput - MIN_SPEED) / (MAX_SPEED - MIN_SPEED) *
-           (1.0 - UTIL_WEIGHT);
-    }
-
-    perfindex = (p1 + p2) * 100.0;
-#endif
-
-    printf("Perf index = %.0f (util) & %.0f (thru) = %.0f/100\n", p1 * 100,
-           p2 * 100, perfindex);
-
-  } else { /* There were errors */
-    perfindex = 0.0;
-    printf("Terminated with %d errors\n", errors);
-  }
-
-  /* Optionally emit autoresult string */
-  if (autograder) {
-    sprintf(autoresult, "%d:%.0f:%.0f:%.0f", numcorrect, (float)perfindex,
-            avg_mm_throughput / 1000.0, avg_mm_util * 100);
-    printf("\nAUTORESULT_STRING=%s\n", autoresult);
-  }
-
-  exit(errors);
+  return mm_stats.valid ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
 /*****************************************************************
@@ -550,7 +344,6 @@ int main(int argc, char **argv) {
 static int add_range(range_t **ranges, char *lo, int size, const trace_t *trace,
                      int opnum, int index) {
   char *hi = lo + size - 1;
-  range_t *p;
 
   assert(size > 0);
 
@@ -575,6 +368,8 @@ static int add_range(range_t **ranges, char *lo, int size, const trace_t *trace,
     return 1;
 
   /* The payload must not overlap any other payloads */
+  range_t *p;
+
   for (p = *ranges; p != NULL; p = p->next) {
     if ((lo >= p->lo && lo <= p->hi) || (hi >= p->lo && hi <= p->hi)) {
       malloc_error(trace, opnum,
@@ -603,10 +398,9 @@ static int add_range(range_t **ranges, char *lo, int size, const trace_t *trace,
  * remove_range - Free the range record of block whose payload starts at lo
  */
 static void remove_range(range_t **ranges, char *lo) {
-  range_t *p;
   range_t **prevpp = ranges;
 
-  for (p = *ranges; p != NULL; p = p->next) {
+  for (range_t *p = *ranges; p != NULL; p = p->next) {
     if (p->lo == lo) {
       *prevpp = p->next;
       free(p);
@@ -620,10 +414,9 @@ static void remove_range(range_t **ranges, char *lo) {
  * clear_ranges - free all of the range records for a trace
  */
 static void clear_ranges(range_t **ranges) {
-  range_t *p;
   range_t *pnext;
 
-  for (p = *ranges; p != NULL; p = pnext) {
+  for (range_t *p = *ranges; p != NULL; p = pnext) {
     pnext = p->next;
     free(p);
   }
@@ -636,54 +429,40 @@ static void clear_ranges(range_t **ranges) {
  *********************************************/
 
 static void init_random_data(void) {
-  int len;
-
   if (debug_mode == DBG_NONE)
     return;
 
-  for (len = 0; len < RANDOM_DATA_LEN; ++len) {
+  for (int len = 0; len < RANDOM_DATA_LEN; ++len)
     random_data[len] = random();
-  }
 }
 
 static void randomize_block(trace_t *traces, int index) {
-  size_t size;
-  size_t i;
-  randint_t *block;
-  int base;
-
   if (debug_mode == DBG_NONE)
     return;
 
   traces->block_rand_base[index] = random();
 
-  block = (randint_t *)traces->blocks[index];
-  size = traces->block_sizes[index] / sizeof(*block);
-  base = traces->block_rand_base[index];
+  randint_t *block = (randint_t *)traces->blocks[index];
+  size_t size = traces->block_sizes[index] / sizeof(*block);
+  int base = traces->block_rand_base[index];
 
-  for (i = 0; i < size; i++) {
+  for (size_t i = 0; i < size; i++)
     block[i] = random_data[(base + i) % RANDOM_DATA_LEN];
-  }
 }
 
 static void check_index(const trace_t *trace, int opnum, int index) {
-  size_t size;
-  size_t i;
-  randint_t *block;
-  int base;
-  int ngarbled = 0;
-  int firstgarbled = -1;
-
   if (index < 0)
     return; /* we're doing free(NULL) */
   if (debug_mode == DBG_NONE)
     return;
 
-  block = (randint_t *)trace->blocks[index];
-  size = trace->block_sizes[index] / sizeof(*block);
-  base = trace->block_rand_base[index];
+  randint_t *block = (randint_t *)trace->blocks[index];
+  size_t size = trace->block_sizes[index] / sizeof(*block);
+  int base = trace->block_rand_base[index];
+  int ngarbled = 0;
+  int firstgarbled = -1;
 
-  for (i = 0; i < size; i++) {
+  for (size_t i = 0; i < size; i++) {
     if (block[i] != random_data[(base + i) % RANDOM_DATA_LEN]) {
       if (firstgarbled == -1)
         firstgarbled = i;
@@ -706,63 +485,57 @@ static void check_index(const trace_t *trace, int opnum, int index) {
 /*
  * read_trace - read a trace file and store it in memory
  */
-static trace_t *read_trace(stats_t *stats, const char *tracedir,
-                           const char *filename) {
+static trace_t *read_trace(stats_t *stats, const char *filename) {
   FILE *tracefile;
   trace_t *trace;
-  char type[MAXLINE];
-  int index, size;
-  int max_index = 0;
-  int op_index;
-  int ignore = 0;
 
   if (verbose > 1)
     printf("Reading tracefile: %s\n", filename);
 
   /* Allocate the trace record */
-  if ((trace = (trace_t *)malloc(sizeof(trace_t))) == NULL)
+  if (!(trace = (trace_t *)malloc(sizeof(trace_t))))
     unix_error("malloc 1 failed in read_trace");
 
   /* Read the trace file header */
-  strcpy(trace->filename, tracedir);
-  strcat(trace->filename, filename);
-  if ((tracefile = fopen(trace->filename, "r")) == NULL) {
+  strcpy(trace->filename, filename);
+  if (!(tracefile = fopen(trace->filename, "r")))
     unix_error("Could not open %s in read_trace", trace->filename);
-  }
+
+  int ignore = 0;
   ignore += fscanf(tracefile, "%d", &trace->weight);
   ignore += fscanf(tracefile, "%d", &trace->num_ids);
   ignore += fscanf(tracefile, "%d", &trace->num_ops);
   ignore += fscanf(tracefile, "%d", &trace->ignore_ranges);
 
-  if (trace->weight < 0 || trace->weight > 3) {
+  if (trace->weight < 0 || trace->weight > 3)
     app_error("%s: weight can only be in {0, 1, 2 3}", trace->filename);
-  }
-  if (trace->ignore_ranges != 0 && trace->ignore_ranges != 1) {
+  if (trace->ignore_ranges != 0 && trace->ignore_ranges != 1)
     app_error("%s: ignore-ranges can only be zero or one", trace->filename);
-  }
 
   /* We'll store each request line in the trace in this array */
-  if ((trace->ops = (traceop_t *)malloc(trace->num_ops * sizeof(traceop_t))) ==
-      NULL)
+  if (!(trace->ops = (traceop_t *)malloc(trace->num_ops * sizeof(traceop_t))))
     unix_error("malloc 2 failed in read_trace");
 
   /* We'll keep an array of pointers to the allocated blocks here... */
-  if ((trace->blocks = (char **)calloc(trace->num_ids, sizeof(char *))) == NULL)
+  if (!(trace->blocks = (char **)calloc(trace->num_ids, sizeof(char *))))
     unix_error("malloc 3 failed in read_trace");
 
   /* ... along with the corresponding byte sizes of each block */
-  if ((trace->block_sizes = (size_t *)calloc(trace->num_ids, sizeof(size_t))) ==
-      NULL)
+  if (!(trace->block_sizes = (size_t *)calloc(trace->num_ids, sizeof(size_t))))
     unix_error("malloc 4 failed in read_trace");
 
   /* and, if we're debugging, the offset into the random data */
-  if ((trace->block_rand_base =
-         calloc(trace->num_ids, sizeof(*trace->block_rand_base))) == NULL)
+  if (!(trace->block_rand_base =
+          calloc(trace->num_ids, sizeof(*trace->block_rand_base))))
     unix_error("malloc 5 failed in read_trace");
 
   /* read every request line in the trace file */
-  index = 0;
-  op_index = 0;
+  int index = 0;
+  int op_index = 0;
+  int max_index = 0;
+  char type[MAXLINE];
+  int size;
+
   while (fscanf(tracefile, "%s", type) != EOF) {
     switch (type[0]) {
       case 'a':
@@ -772,6 +545,7 @@ static trace_t *read_trace(stats_t *stats, const char *tracedir,
         trace->ops[op_index].size = size;
         max_index = (index > max_index) ? index : max_index;
         break;
+
       case 'r':
         ignore += fscanf(tracefile, "%u %u", &index, &size);
         trace->ops[op_index].type = REALLOC;
@@ -779,11 +553,13 @@ static trace_t *read_trace(stats_t *stats, const char *tracedir,
         trace->ops[op_index].size = size;
         max_index = (index > max_index) ? index : max_index;
         break;
+
       case 'f':
         ignore += fscanf(tracefile, "%ud", &index);
         trace->ops[op_index].type = FREE;
         trace->ops[op_index].index = index;
         break;
+
       default:
         app_error("Bogus type character (%c) in tracefile %s\n", type[0],
                   trace->filename);
@@ -792,6 +568,7 @@ static trace_t *read_trace(stats_t *stats, const char *tracedir,
     if (op_index == trace->num_ops)
       break;
   }
+
   fclose(tracefile);
   assert(max_index == trace->num_ids - 1);
   assert(trace->num_ops == op_index);
@@ -834,13 +611,6 @@ static void free_trace(trace_t *trace) {
  * eval_mm_valid - Check the mm malloc package for correctness
  */
 static int eval_mm_valid(trace_t *trace, range_t **ranges) {
-  int i;
-  int index;
-  size_t size;
-  char *newp;
-  char *oldp;
-  char *p;
-
   /* Reset the heap and free any records in the range list */
   mem_reset_brk();
   clear_ranges(ranges);
@@ -853,18 +623,19 @@ static int eval_mm_valid(trace_t *trace, range_t **ranges) {
   }
 
   /* Interpret each operation in the trace in order */
-  for (i = 0; i < trace->num_ops; i++) {
-    index = trace->ops[i].index;
-    size = trace->ops[i].size;
+  for (int i = 0; i < trace->num_ops; i++) {
+    int index = trace->ops[i].index;
+    size_t size = trace->ops[i].size;
+    char *newp;
+    char *oldp;
+    char *p;
 
     if (debug_mode == DBG_EXPENSIVE) {
-      range_t *r;
-
       /* Let the students check their own heap */
       mm_checkheap(verbose);
 
       /* Now check that all our allocated blocks have the right data */
-      r = *ranges;
+      range_t *r = *ranges;
       while (r) {
         check_index(trace, i, r->index);
         r = r->next;
@@ -872,9 +643,7 @@ static int eval_mm_valid(trace_t *trace, range_t **ranges) {
     }
 
     switch (trace->ops[i].type) {
-
       case ALLOC: /* mm_malloc */
-
         /* Call the student's malloc */
         if ((p = mm_malloc(size)) == NULL) {
           malloc_error(trace, i, "mm_malloc failed.");
@@ -908,9 +677,7 @@ static int eval_mm_valid(trace_t *trace, range_t **ranges) {
           return 0;
         }
         if ((newp != NULL) && (size == 0)) {
-          malloc_error(trace, i,
-                       "mm_realloc with size 0 returned "
-                       "non-NULL.");
+          malloc_error(trace, i, "mm_realloc with size 0 returned non-NULL.");
           return 0;
         }
 
@@ -918,17 +685,14 @@ static int eval_mm_valid(trace_t *trace, range_t **ranges) {
         remove_range(ranges, oldp);
 
         /* Check new block for correctness and add it to range list */
-        if (size > 0) {
-          if (add_range(ranges, newp, size, trace, i, index) == 0)
-            return 0;
-        }
+        if (size > 0 && add_range(ranges, newp, size, trace, i, index) == 0)
+          return 0;
 
         /* Move the region from where it was.
          * Check up to min(size, oldsize) for correct copying. */
         trace->blocks[index] = newp;
-        if (size < trace->block_sizes[index]) {
+        if (size < trace->block_sizes[index])
           trace->block_sizes[index] = size;
-        }
         check_index(trace, i, index);
         trace->block_sizes[index] = size;
 
@@ -970,32 +734,28 @@ static int eval_mm_valid(trace_t *trace, range_t **ranges) {
  *
  *   A higher number is better: 1 is optimal.
  */
-static double eval_mm_util(trace_t *trace, int tracenum) {
-  int i;
-  int index;
-  int size, newsize, oldsize;
+static double eval_mm_util(trace_t *trace) {
   int max_total_size = 0;
   int total_size = 0;
-  char *p;
-  char *newp, *oldp;
 
   reinit_trace(trace);
 
   /* initialize the heap and the mm malloc package */
   mem_reset_brk();
   if (mm_init() < 0)
-    app_error("trace %d: mm_init failed in eval_mm_util", tracenum);
+    app_error("trace: mm_init failed in eval_mm_util");
 
-  for (i = 0; i < trace->num_ops; i++) {
+  for (int i = 0; i < trace->num_ops; i++) {
+    int index, size, newsize, oldsize;
+    char *p, *newp, *oldp;
+
     switch (trace->ops[i].type) {
-
       case ALLOC: /* mm_alloc */
         index = trace->ops[i].index;
         size = trace->ops[i].size;
 
-        if ((p = mm_malloc(size)) == NULL) {
-          app_error("trace %d: mm_malloc failed in eval_mm_util", tracenum);
-        }
+        if ((p = mm_malloc(size)) == NULL)
+          app_error("trace: mm_malloc failed in eval_mm_util");
 
         /* Remember region and size */
         trace->blocks[index] = p;
@@ -1010,9 +770,8 @@ static double eval_mm_util(trace_t *trace, int tracenum) {
         oldsize = trace->block_sizes[index];
 
         oldp = trace->blocks[index];
-        if ((newp = mm_realloc(oldp, newsize)) == NULL && newsize != 0) {
-          app_error("trace %d: mm_realloc failed in eval_mm_util", tracenum);
-        }
+        if ((newp = mm_realloc(oldp, newsize)) == NULL && newsize != 0)
+          app_error("trace: mm_realloc failed in eval_mm_util");
 
         /* Remember region and size */
         trace->blocks[index] = newp;
@@ -1037,8 +796,7 @@ static double eval_mm_util(trace_t *trace, int tracenum) {
         break;
 
       default:
-        app_error("trace %d: Nonexistent request type in eval_mm_util",
-                  tracenum);
+        app_error("trace: Nonexistent request type in eval_mm_util");
     }
 
     /* update the high-water mark */
@@ -1054,8 +812,6 @@ static double eval_mm_util(trace_t *trace, int tracenum) {
  *    to measure the running time of the mm malloc package.
  */
 static void eval_mm_speed(void *ptr) {
-  int i, index, size, newsize;
-  char *p, *newp, *oldp, *block;
   trace_t *trace = ((speed_t *)ptr)->trace;
   reinit_trace(trace);
 
@@ -1065,9 +821,11 @@ static void eval_mm_speed(void *ptr) {
     app_error("mm_init failed in eval_mm_speed");
 
   /* Interpret each trace request */
-  for (i = 0; i < trace->num_ops; i++)
-    switch (trace->ops[i].type) {
+  for (int i = 0; i < trace->num_ops; i++) {
+    int index, size, newsize;
+    char *p, *newp, *oldp, *block;
 
+    switch (trace->ops[i].type) {
       case ALLOC: /* mm_malloc */
         index = trace->ops[i].index;
         size = trace->ops[i].size;
@@ -1098,6 +856,7 @@ static void eval_mm_speed(void *ptr) {
       default:
         app_error("Nonexistent request type in eval_mm_speed");
     }
+  }
 }
 
 /*
@@ -1107,14 +866,13 @@ static void eval_mm_speed(void *ptr) {
  *
  */
 static int eval_libc_valid(trace_t *trace) {
-  int i, newsize;
-  char *p, *newp, *oldp;
-
   reinit_trace(trace);
 
-  for (i = 0; i < trace->num_ops; i++) {
-    switch (trace->ops[i].type) {
+  for (int i = 0; i < trace->num_ops; i++) {
+    char *p, *newp, *oldp;
+    int newsize;
 
+    switch (trace->ops[i].type) {
       case ALLOC: /* malloc */
         if ((p = malloc(trace->ops[i].size)) == NULL) {
           malloc_error(trace, i, "libc malloc failed");
@@ -1155,14 +913,14 @@ static int eval_libc_valid(trace_t *trace) {
  *    of traces.
  */
 static void eval_libc_speed(void *ptr) {
-  int i;
-  int index, size, newsize;
-  char *p, *newp, *oldp, *block;
   trace_t *trace = ((speed_t *)ptr)->trace;
 
   reinit_trace(trace);
 
-  for (i = 0; i < trace->num_ops; i++) {
+  for (int i = 0; i < trace->num_ops; i++) {
+    char *p, *newp, *oldp, *block;
+    int index, size, newsize;
+
     switch (trace->ops[i].type) {
       case ALLOC: /* malloc */
         index = trace->ops[i].index;
@@ -1202,128 +960,88 @@ static void eval_libc_speed(void *ptr) {
 /*
  * printresults - prints a performance summary for some malloc package
  */
-static void printresults(int n, stats_t *stats) {
-  int i;
-  /* weighted sums all */
-  double sumsecs = 0;
-  double sumops = 0;
-  double sumutil = 0;
-  int sum_perf_weight = 0;
-  int sum_util_weight = 0;
-
-  char wstr;
-
+static void printresults(stats_t *stats) {
   /* Print the individual results for each trace */
   printf("  %2s%6s %5s%8s%10s  %s\n", "valid", "util", "ops", "secs", "Kops",
          "trace");
-  for (i = 0; i < n; i++) {
-    if (stats[i].valid) {
-      switch (stats[i].weight) {
-        case WNONE:
-          wstr = ' ';
-          break;
-        case WALL:
-          wstr = '*';
-          break;
-        case WUTIL:
-          wstr = 'u';
-          break;
-        case WPERF:
-          wstr = 'p';
-          break;
-        default:
-          app_error("wrong value for weight found!");
-      }
-
-      /* prints done in a somewhat silly way to avoid hassle
-       * if future columns need to be added/modified like this time */
-
-      printf("%2c", wstr);
-      printf("%4s", "yes");
-
-      /* print '--' if util isn't weighted */
-      if (stats[i].weight == WNONE || stats[i].weight == WALL ||
-          stats[i].weight == WUTIL)
-        printf(" %5.0f%%", stats[i].util * 100.0);
-      else
-        printf(" %6s", "--");
-
-      /* print '--' if perf isn't weighted */
-      if (stats[i].weight == WNONE || stats[i].weight == WALL ||
-          stats[i].weight == WPERF)
-        printf("%8.0f%10.6f%7.0f", stats[i].ops, stats[i].secs,
-               (stats[i].ops / 1e3) / stats[i].secs);
-      else
-        printf("%8s%10s%7s", "--", "--", "--");
-
-      printf(" %s\n", stats[i].filename);
-
-      if (stats[i].weight == WALL || stats[i].weight == WPERF) {
-        sum_perf_weight += 1;
-        sumsecs += stats[i].secs;
-        sumops += stats[i].ops;
-      }
-      if (stats[i].weight == WALL || stats[i].weight == WUTIL) {
-        sum_util_weight += 1;
-        sumutil += stats[i].util;
-      }
-    } else {
-      printf("%2s%4s %6s%8s%10s%7s %s\n", stats[i].weight != 0 ? "*" : "", "no",
-             "-", "-", "-", "-", stats[i].filename);
-    }
+  if (!stats->valid) {
+    printf("%2s%4s %6s%8s%10s%7s %s\n", stats->weight != 0 ? "*" : "", "no",
+           "-", "-", "-", "-", stats->filename);
+    return;
   }
 
-  /* Print the aggregate results for the set of traces */
-  if (errors == 0) {
-    if (sum_perf_weight == 0)
-      sum_perf_weight = 1;
-    if (sum_util_weight == 0)
-      sum_util_weight = 1;
-
-    printf("%2d %2d  %5.0f%%%8.0f%10.6f%7.0f\n", sum_util_weight,
-           sum_perf_weight, (sumutil / (double)sum_util_weight) * 100.0, sumops,
-           sumsecs, (sumsecs == 0.0) ? 0 : (sumops / 1e3) / sumsecs);
-  } else {
-    printf("     %8s%10s%7s\n", "-", "-", "-");
+  char wstr;
+  switch (stats->weight) {
+    case WNONE:
+      wstr = ' ';
+      break;
+    case WALL:
+      wstr = '*';
+      break;
+    case WUTIL:
+      wstr = 'u';
+      break;
+    case WPERF:
+      wstr = 'p';
+      break;
+    default:
+      app_error("wrong value for weight found!");
   }
+
+  /* prints done in a somewhat silly way to avoid hassle
+   * if future columns need to be added/modified like this time */
+  printf("%2c", wstr);
+  printf("%4s", "yes");
+
+  /* print '--' if util isn't weighted */
+  if (stats->weight == WNONE || stats->weight == WALL || stats->weight == WUTIL)
+    printf(" %5.1f%%", stats->util * 100.0);
+  else
+    printf(" %6s", "--");
+
+  /* print '--' if perf isn't weighted */
+  if (stats->weight == WNONE || stats->weight == WALL || stats->weight == WPERF)
+    printf("%8.0f%10.6f%7.0f", stats->ops, stats->secs,
+           (stats->ops / 1e3) / stats->secs);
+  else
+    printf("%8s%10s%7s", "--", "--", "--");
+
+  printf(" %s\n", stats->filename);
 }
 
 /*
  * app_error - Report an arbitrary application error
  */
-void app_error(const char *fmt, ...) {
+static void app_error(const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
   vprintf(fmt, ap);
   va_end(ap);
-  exit(1);
+  exit(EXIT_FAILURE);
 }
 
 /*
  * unix_error - Report the error and its errno.
  */
-void unix_error(const char *fmt, ...) {
+static void unix_error(const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
   vprintf(fmt, ap);
   printf(": %s\n", strerror(errno));
   va_end(ap);
-  exit(1);
+  exit(EXIT_FAILURE);
 }
 
 /*
  * malloc_error - Report an error returned by the mm_malloc package
  */
-void malloc_error(const trace_t *trace, int opnum, const char *fmt, ...) {
+static void malloc_error(const trace_t *trace, int opnum, const char *fmt,
+                         ...) {
   va_list ap;
   va_start(ap, fmt);
-
-  errors++;
-
   printf("ERROR [trace %s, line %d]: ", trace->filename, LINENUM(opnum));
   vprintf(fmt, ap);
   putchar('\n');
-
   va_end(ap);
 }
 
@@ -1331,18 +1049,13 @@ void malloc_error(const trace_t *trace, int opnum, const char *fmt, ...) {
  * usage - Explain the command line arguments
  */
 static void usage(void) {
-  fprintf(stderr, "Usage: mdriver [-hlVdD] [-f <file>]\n");
+  fprintf(stderr, "Usage: mdriver [-hlVD] [-d <i>] [-v <i>] [-f <file>]\n");
   fprintf(stderr, "Options\n");
   fprintf(stderr, "\t-d <i>     Debug: 0 off; 1 default; 2 lots.\n");
   fprintf(stderr, "\t-D         Equivalent to -d2.\n");
-  fprintf(
-    stderr,
-    "\t-c <file>  Run trace file <file> once, check for correctness only.\n");
-  fprintf(stderr, "\t-t <dir>   Directory to find default traces.\n");
   fprintf(stderr, "\t-h         Print this message.\n");
-  fprintf(stderr, "\t-l         Run libc malloc as well.\n");
+  fprintf(stderr, "\t-l         Run libc malloc instead mm.\n");
   fprintf(stderr, "\t-V         Print diagnostics as each trace is run.\n");
   fprintf(stderr, "\t-v <i>     Set Verbosity Level to <i>\n");
-  fprintf(stderr, "\t-s <s>     Timeout after s secs (default no timeout)\n");
   fprintf(stderr, "\t-f <file>  Use <file> as the trace file.\n");
 }

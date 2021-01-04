@@ -10,8 +10,8 @@
       "points": 1
     },
     {
-      "name": "Run tests",
-      "run": "make test",
+      "name": "Grade solution",
+      "run": "make grade",
       "input": "",
       "output": "",
       "comparison": "included",
