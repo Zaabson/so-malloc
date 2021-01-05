@@ -4,6 +4,8 @@ import subprocess
 import sys
 
 
+MINUTIL = 60
+TIMEOUT = 30
 TRACEFILES = [
         "traces/amptjp-bal.rep",
         "traces/amptjp.rep",
@@ -67,53 +69,73 @@ TRACEFILES_EXTRA = [
         "traces-private/seglist.rep"]
 
 
+def runtrace(trace):
+    mdriver = subprocess.run([
+        "valgrind",
+        "--tool=callgrind",
+        "--callgrind-out-file=callgrind.out",
+        "--toggle-collect=mm_malloc",
+        "--toggle-collect=mm_free",
+        "--toggle-collect=mm_realloc",
+        "--toggle-collect=mm_calloc",
+        "--", "./mdriver", "-f", trace],
+        capture_output=True, timeout=TIMEOUT)
+
+    print(mdriver.stdout.decode())
+    if mdriver.returncode:
+        sys.exit(1)
+
+    # Process statistics from mdriver
+    stats = mdriver.stdout.decode().splitlines()[3][4:].split()
+    try:
+        util = float(stats[1][:-1])
+    except ValueError:
+        util = 0.0
+
+    annotate = subprocess.run([
+        "callgrind_annotate", "--tree=calling", "callgrind.out"],
+        capture_output=True)
+
+    # Process output from callgrind_annotate
+    insn = 0
+    show = 10000
+    for i, line in enumerate(annotate.stdout.decode().splitlines()):
+        if i >= show and line:
+            print(line)
+        if 'PROGRAM TOTALS' in line:
+            insn = int(line.strip().split()[0].replace(',', ''))
+        if 'file:function' in line:
+            show = i + 3
+
+    sys.stdout.flush()
+
+    return util, insn
+
+
 if __name__ == '__main__':
     all_ops = []
     all_insn = []
     all_util = []
 
     for trace in TRACEFILES:
+        print("\nRunning mdriver for '%s'..." % trace)
+
+        with open(trace, "r") as f:
+            _ = int(f.readline())
+            _ = int(f.readline())
+            ops = int(f.readline())
+
+        util = 0.0              # default utilization penalty for timeout
+        insn = 50000.0 * ops    # default throughput penalty for timeout
+
         try:
-            mdriver = subprocess.run([
-                "valgrind",
-                "--tool=callgrind",
-                "--callgrind-out-file=callgrind.out",
-                "--toggle-collect=mm_malloc",
-                "--toggle-collect=mm_free",
-                "--toggle-collect=mm_realloc",
-                "--toggle-collect=mm_calloc",
-                "--", "./mdriver", "-f", trace],
-                capture_output=True, timeout=60)
+            util, insn = runtrace(trace)
         except subprocess.TimeoutExpired:
-            print("Killed due to timeout of 60s.")
-            continue
+            print("Penalty accrued for timeout of %ds." % TIMEOUT)
 
-        print(mdriver.stdout.decode())
-        if mdriver.returncode:
-            sys.exit(1)
-
-        # Process statistics from mdriver
-        stats = mdriver.stdout.decode().splitlines()[3][4:].split()
-        try:
-            util = float(stats[1][:-1])
-        except ValueError:
-            util = 0.0
+        all_insn.append(insn)
         all_util.append(util)
-
-        all_ops.append(int(stats[2]))
-
-        annotate = subprocess.run([
-            "callgrind_annotate", "--tree=calling", "callgrind.out"],
-            capture_output=True)
-
-        # Process output from callgrind_annotate
-        for line in annotate.stdout.decode().splitlines()[26:]:
-            if not line:
-                continue
-            print(line)
-            all_insn.append(int(line.split()[0].replace(',', '')))
-
-        sys.stdout.flush()
+        all_ops.append(ops)
 
     # Grade solution
     weighted_util = 0
@@ -122,3 +144,9 @@ if __name__ == '__main__':
 
     print("\nWeighted memory utilization: %.1f%%" % weighted_util)
     print("Instructions per operation: %d" % (sum(all_insn) / sum(all_ops)))
+
+    if weighted_util < MINUTIL:
+        print("Minimum threshold for memory utilization "
+              "of %d%% has not been met!" % weighted_util)
+        print("Your solution was disqualified! :(")
+        sys.exit(1)

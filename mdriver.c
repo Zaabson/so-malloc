@@ -508,7 +508,7 @@ static trace_t *read_trace(stats_t *stats, const char *filename) {
   ignore += fscanf(tracefile, "%d", &trace->ignore_ranges);
 
   if (trace->weight < 0 || trace->weight > 3)
-    app_error("%s: weight can only be in {0, 1, 2 3}", trace->filename);
+    app_error("%s: weight can only be in {0, 1, 2, 3}", trace->filename);
   if (trace->ignore_ranges != 0 && trace->ignore_ranges != 1)
     app_error("%s: ignore-ranges can only be zero or one", trace->filename);
 
