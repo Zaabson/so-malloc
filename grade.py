@@ -147,6 +147,6 @@ if __name__ == '__main__':
 
     if weighted_util < MINUTIL:
         print("Minimum threshold for memory utilization "
-              "of %d%% has not been met!" % weighted_util)
+              "of %d%% has not been met!" % MINUTIL)
         print("Your solution was disqualified! :(")
         sys.exit(1)
