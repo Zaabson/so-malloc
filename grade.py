@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import signal
 import subprocess
 import sys
 
@@ -83,6 +84,9 @@ def runtrace(trace):
 
     print(mdriver.stdout.decode())
     if mdriver.returncode:
+        if mdriver.returncode < 0:
+            signame = signal.Signals(-mdriver.returncode).name
+            print("Your solution has been terminated by %s!" % signame)
         sys.exit(1)
 
     # Process statistics from mdriver
