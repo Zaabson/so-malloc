@@ -105,6 +105,8 @@ typedef struct {
 
   /* defined only for the student malloc package */
   double util; /* space utilization for this trace (always 0 for libc) */
+  int used;    /* maximum bytes used by allocated blocks */
+  int total;   /* total heap size */
 
   /* Note: secs and util are only defined if valid is true */
 } stats_t;
@@ -157,7 +159,7 @@ static void eval_libc_speed(void *ptr);
 /* Routines for evaluating correctnes, space utilization, and speed
    of the student's malloc package in mm.c */
 static int eval_mm_valid(trace_t *trace, range_t **ranges);
-static double eval_mm_util(trace_t *trace);
+static double eval_mm_util(trace_t *trace, int *used_p, int *total_p);
 static void eval_mm_speed(void *ptr);
 
 /* Various helper routines */
@@ -209,7 +211,7 @@ static void run_tests(char *tracefile, stats_t *mm_stats, range_t *ranges,
   if (mm_stats->valid) {
     if (verbose > 1)
       printf("efficiency, ");
-    mm_stats->util = eval_mm_util(trace);
+    mm_stats->util = eval_mm_util(trace, &mm_stats->used, &mm_stats->total);
     speed_params->trace = trace;
     speed_params->ranges = ranges;
     if (verbose > 1)
@@ -734,7 +736,7 @@ static int eval_mm_valid(trace_t *trace, range_t **ranges) {
  *
  *   A higher number is better: 1 is optimal.
  */
-static double eval_mm_util(trace_t *trace) {
+static double eval_mm_util(trace_t *trace, int *used_p, int *total_p) {
   int max_total_size = 0;
   int total_size = 0;
 
@@ -803,6 +805,9 @@ static double eval_mm_util(trace_t *trace) {
     max_total_size =
       (total_size > max_total_size) ? total_size : max_total_size;
   }
+
+  *used_p = max_total_size;
+  *total_p = mem_heapsize();
 
   return ((double)max_total_size / (double)mem_heapsize());
 }
@@ -962,8 +967,8 @@ static void eval_libc_speed(void *ptr) {
  */
 static void printresults(stats_t *stats) {
   /* Print the individual results for each trace */
-  printf("  %2s%6s %5s%8s%10s  %s\n", "valid", "util", "ops", "secs", "Kops",
-         "trace");
+  printf("  %2s%6s%8s%8s %5s%8s%10s  %s\n", "valid", "util", "used", "total",
+         "ops", "secs", "Kops", "trace");
   if (!stats->valid) {
     printf("%2s%4s %6s%8s%10s%7s %s\n", stats->weight != 0 ? "*" : "", "no",
            "-", "-", "-", "-", stats->filename);
@@ -995,9 +1000,9 @@ static void printresults(stats_t *stats) {
 
   /* print '--' if util isn't weighted */
   if (stats->weight == WNONE || stats->weight == WALL || stats->weight == WUTIL)
-    printf(" %5.1f%%", stats->util * 100.0);
+    printf(" %5.1f%% %8d %8d", stats->util * 100.0, stats->used, stats->total);
   else
-    printf(" %6s", "--");
+    printf(" %6s %8s %8s", "--", "--", "--");
 
   /* print '--' if perf isn't weighted */
   if (stats->weight == WNONE || stats->weight == WALL || stats->weight == WPERF)

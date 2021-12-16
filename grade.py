@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 
+import math
 import signal
 import subprocess
 import sys
+
+
+STUDENT_DEFINED = ['mm_calloc', 'mm_checkheap', 'mm_free', 'mm_init',
+                   'mm_malloc', 'mm_realloc']
 
 
 MINUTIL = 60
@@ -96,6 +101,16 @@ def runtrace(trace):
     except ValueError:
         util = 0.0
 
+    try:
+        used = int(stats[2])
+    except ValueError:
+        used = math.inf
+
+    try:
+        total = int(stats[3])
+    except ValueError:
+        total = math.inf
+
     annotate = subprocess.run([
         "callgrind_annotate", "--tree=calling", "callgrind.out"],
         capture_output=True)
@@ -113,13 +128,24 @@ def runtrace(trace):
 
     sys.stdout.flush()
 
-    return util, insn
+    return util, insn, used, total
 
 
 if __name__ == '__main__':
+    nm = subprocess.run(['nm', '-g', '--defined-only', 'mm.o'],
+                        stdout=subprocess.PIPE)
+    for line in nm.stdout.decode('utf-8').splitlines():
+        symbol = line.split()[-1]
+        if symbol not in STUDENT_DEFINED:
+            print(f'Symbol "{symbol}" in "mm.o" cannot be visible externally!')
+            print("Your solution was disqualified! :(")
+            sys.exit(1)
+
     all_ops = []
     all_insn = []
     all_util = []
+    all_used = []
+    all_total = []
 
     for trace in TRACEFILES:
         print("\nRunning mdriver for '%s'..." % trace)
@@ -131,22 +157,28 @@ if __name__ == '__main__':
 
         util = 0.0              # default utilization penalty for timeout
         insn = 50000.0 * ops    # default throughput penalty for timeout
+        heapsz = math.inf
 
         try:
-            util, insn = runtrace(trace)
+            util, insn, used, total = runtrace(trace)
         except subprocess.TimeoutExpired:
             print("Penalty accrued for timeout of %ds." % TIMEOUT)
 
         all_insn.append(insn)
         all_util.append(util)
         all_ops.append(ops)
+        all_used.append(used)
+        all_total.append(total)
 
     # Grade solution
     weighted_util = 0
     for util, ops in zip(all_util, all_ops):
         weighted_util += util * (ops / sum(all_ops))
 
+    total_util = sum(all_used) / sum(all_total)
+
     print("\nWeighted memory utilization: %.1f%%" % weighted_util)
+    print("Total memory utilization: %.2f%%" % (100.0 * total_util))
     print("Instructions per operation: %d" % (sum(all_insn) / sum(all_ops)))
 
     if weighted_util < MINUTIL:
